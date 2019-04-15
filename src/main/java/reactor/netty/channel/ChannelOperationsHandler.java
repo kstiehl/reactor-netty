@@ -18,13 +18,11 @@ package reactor.netty.channel;
 
 import java.nio.charset.Charset;
 import java.util.Objects;
-import java.util.Queue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
-import java.util.function.BiConsumer;
-import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import javax.annotation.Nullable;
@@ -40,7 +38,6 @@ import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundBuffer;
 import io.netty.channel.ChannelPromise;
-import io.netty.channel.EventLoop;
 import io.netty.channel.FileRegion;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.DecoderResultProvider;
@@ -56,7 +53,6 @@ import reactor.netty.NettyOutbound;
 import reactor.netty.NettyPipeline;
 import reactor.util.Logger;
 import reactor.util.Loggers;
-import reactor.util.concurrent.Queues;
 import reactor.util.context.Context;
 
 import static reactor.netty.ReactorNetty.format;
@@ -75,12 +71,6 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 	final ConnectionObserver        listener;
 	final ChannelOperations.OnSetup opsFactory;
 
-	/**
-	 * Cast the supplied queue (SpscLinkedArrayQueue) to use its atomic dual-insert
-	 * backed by {@link BiPredicate#test}
-	 **/
-	BiPredicate<ChannelFuture, Object>  pendingWriteOffer;
-	Queue<?>                            pendingWrites;
 	ChannelHandlerContext               ctx;
 	boolean                             flushOnEach;
 	boolean                             flushOnEachWithEventLoop;
@@ -94,7 +84,6 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 	volatile int     wip;
 	volatile long    scheduledFlush;
 
-	@SuppressWarnings("unchecked")
 	ChannelOperationsHandler(ChannelOperations.OnSetup opsFactory, ConnectionObserver listener) {
 		this.inner = new PublisherSender(this);
 		this.prefetch = 32;
@@ -231,21 +220,23 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 	}
 
 	@Override
-	@SuppressWarnings({"unchecked", "FutureReturnValueIgnored"})
+	@SuppressWarnings("FutureReturnValueIgnored")
 	public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-		if (log.isDebugEnabled() && msg != ChannelOperations.TERMINATED_OPS) {
+		if (log.isDebugEnabled()) {
 			log.debug(format(ctx.channel(), "Writing object {}"), msg);
 		}
 
-		if (pendingWrites == null) {
-			this.pendingWrites = Queues.unbounded()
-			                           .get();
-			this.pendingWriteOffer = (BiPredicate<ChannelFuture, Object>) pendingWrites;
+		if (innerActive) {
+			// Returned value is deliberately ignored
+			promise.setFailure(new IllegalStateException("Publisher already active"));
 		}
 
-		if (!pendingWriteOffer.test(promise, msg)) {
+		if (msg != ChannelOperations.TERMINATED_OPS) {
+			drain(msg, promise);
+		}
+		else if (!TERMINATED_OPERATIONS.compareAndSet(null, promise)) {
 			// Returned value is deliberately ignored
-			promise.setFailure(new IllegalStateException("Send Queue full?!"));
+			promise.setFailure(new IllegalStateException("Cannot process the termination message"));
 		}
 	}
 
@@ -269,22 +260,20 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		}
 	}
 
-	ChannelFuture doWrite(Object msg, ChannelPromise promise, @Nullable PublisherSender inner) {
+	void doWrite(Object msg, ChannelPromise promise, @Nullable PublisherSender inner) {
 		if (flushOnEach || //fastpath
-				(inner == null && pendingWrites.isEmpty()) || //last drained element
+				inner == null || //last drained element
 				!ctx.channel()
-				    .isWritable() //force flush if write buffer full
-				) {
+				    .isWritable()) { //force flush if write buffer full
 			pendingBytes = 0L;
 
-			ChannelFuture future = ctx.write(msg, promise);
+			ctx.write(msg, promise);
 			if (flushOnEachWithEventLoop && ctx.channel().isWritable()) {
 				scheduleFlush();
 			}
 			else {
 				ctx.flush();
 			}
-			return future;
 		}
 		else {
 			if (msg instanceof ByteBuf) {
@@ -302,12 +291,11 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 			if (log.isTraceEnabled()) {
 				log.trace(format(ctx.channel(), "Pending write size = {}"), pendingBytes);
 			}
-			ChannelFuture future = ctx.write(msg, promise);
+			ctx.write(msg, promise);
 			if (!ctx.channel().isWritable()) {
 				pendingBytes = 0L;
 				ctx.flush();
 			}
-			return future;
 		}
 	}
 
@@ -331,143 +319,113 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 	}
 
 	void discard() {
-		for (; ; ) {
-			if (pendingWrites == null || pendingWrites.isEmpty()) {
-				return;
-			}
-
-			ChannelPromise promise;
-			Object v = pendingWrites.poll();
-
-			try {
-				promise = (ChannelPromise) v;
-			}
-			catch (Throwable e) {
-				ctx.fireExceptionCaught(e);
-				return;
-			}
-			v = pendingWrites.poll();
-			if (v == ChannelOperations.TERMINATED_OPS) {
-				continue;
-			}
+		if (TERMINATED_OPERATIONS.get() != null) {
+			//TODO currently the TERMINATED_OPS promise is not notified
+			// do we need to notify it?
+			TERMINATED_OPERATIONS.set(null);
+		}
+		else if (inner != null && PublisherSender.PENDING_WRITES.get(inner) == 1) {
 			if (log.isDebugEnabled()) {
-				log.debug(format(ctx.channel(), "Terminated ChannelOperation. Dropping Pending Write: {}"),
-						v);
+				log.debug(format(ctx.channel(), "Terminated ChannelOperation. Dropping Pending Write"));
 			}
-			ReferenceCountUtil.release(v);
-			promise.tryFailure(new AbortedException("Connection has been closed"));
+			inner.lastWrite.tryFailure(new AbortedException("Connection has been closed"));
+			PublisherSender.PENDING_WRITES.compareAndSet(inner, 1, 0);
 		}
 	}
 
-	@SuppressWarnings({"unchecked", "FutureReturnValueIgnored"})
+	@SuppressWarnings("FutureReturnValueIgnored")
 	void drain() {
-		if (WIP.getAndIncrement(this) == 0) {
+		ChannelPromise pr = TERMINATED_OPERATIONS.get();
+		if (pr != null) {
+			drain(ChannelOperations.TERMINATED_OPS, pr);
+		}
+		else if (inner != null && PublisherSender.PENDING_WRITES.get(inner) == 1) {
+			drain(PublisherSender.PENDING_WRITES_MESSAGE, inner.lastWrite);
+		}
+		else {
+			drain(null, null);
+		}
+	}
 
-			for (; ; ) {
-				if (removed) {
-					discard();
-					return;
+	@SuppressWarnings("FutureReturnValueIgnored")
+	void drain(@Nullable Object message, @Nullable ChannelPromise promise) {
+		if (WIP.compareAndSet(this, 0, 1)) {
+
+			if (removed) {
+				discard();
+				WIP.decrementAndGet(this);
+				return;
+			}
+
+			if ((message == null && promise == null) ||
+					innerActive ||
+					!ctx.channel()
+						.isWritable()) {
+				if (!ctx.channel().isWritable() && hasPendingWriteBytes()) {
+					ctx.flush();
 				}
+				WIP.decrementAndGet(this);
+				return;
+			}
 
-				if (pendingWrites == null || innerActive || !ctx.channel()
-				                                                .isWritable()) {
-					if (!ctx.channel().isWritable() && hasPendingWriteBytes()) {
-						ctx.flush();
-					}
-					if (WIP.decrementAndGet(this) == 0) {
-						break;
-					}
-					continue;
-				}
-
-				ChannelFuture future;
-				Object v = pendingWrites.poll();
-
-				try {
-					future = (ChannelFuture) v;
-				}
-				catch (Throwable e) {
-					ctx.fireExceptionCaught(e);
-					return;
-				}
-
-				boolean empty = future == null;
-
-				if (empty) {
-					if (WIP.decrementAndGet(this) == 0) {
-						break;
-					}
-					continue;
-				}
-
-				v = pendingWrites.poll();
-
-				if (!innerActive && v == PublisherSender.PENDING_WRITES) {
-					boolean last = pendingWrites.isEmpty();
-					if (!future.isDone() && hasPendingWriteBytes()) {
-						ctx.flush();
-						if (!future.isDone() && hasPendingWriteBytes()) {
-							if (!pendingWriteOffer.test(future, v) && future instanceof ChannelPromise) {
-								// Returned value is deliberately ignored
-								((ChannelPromise) future).setFailure(new IllegalStateException("Send Queue full?!"));
-							}
-						}
-					}
-					if (last && WIP.decrementAndGet(this) == 0) {
-						break;
+			if (!innerActive && message == PublisherSender.PENDING_WRITES_MESSAGE) {
+				if (!promise.isDone() && hasPendingWriteBytes()) {
+					ctx.flush();
+					if (promise.isDone() || !hasPendingWriteBytes()) {
+						PublisherSender.PENDING_WRITES.compareAndSet(inner, 1, 0);
 					}
 				}
-				else if (future instanceof ChannelPromise) {
-					ChannelPromise promise = (ChannelPromise) future;
-					if (v == ChannelOperations.TERMINATED_OPS) {
-						promise.setSuccess(null);
-					}
-					else if (v instanceof Publisher) {
-						Publisher<?> p = (Publisher<?>) v;
-	
-						if (p instanceof Callable) {
-							@SuppressWarnings("unchecked") Callable<?> supplier =
-									(Callable<?>) p;
-	
-							Object vr;
-	
-							try {
-								vr = supplier.call();
-							}
-							catch (Throwable e) {
-								// Returned value is deliberately ignored
-								promise.setFailure(e);
-								continue;
-							}
-	
-							if (vr == null) {
-								// Returned value is deliberately ignored
-								promise.setSuccess();
-								continue;
-							}
-	
-							if (inner.unbounded) {
-								// Returned value is deliberately ignored
-								doWrite(vr, promise, null);
-							}
-							else {
-								innerActive = true;
-								inner.promise = promise;
-								inner.onSubscribe(Operators.scalarSubscription(inner, vr));
-							}
-						}
-						else {
-							innerActive = true;
-							inner.promise = promise;
-							p.subscribe(inner);
-						}
-					}
-					else {
-						// Returned value is deliberately ignored
-						doWrite(v, promise, null);
-					}
+				else {
+					PublisherSender.PENDING_WRITES.compareAndSet(inner, 1, 0);
 				}
 			}
+			else if (message == ChannelOperations.TERMINATED_OPS) {
+				TERMINATED_OPERATIONS.set(null);
+				promise.setSuccess(null);
+			}
+			else if (message instanceof Publisher) {
+				Publisher<?> p = (Publisher<?>) message;
+
+				if (p instanceof Callable) {
+					Callable<?> supplier = (Callable<?>) p;
+
+					Object vr;
+
+					try {
+						vr = supplier.call();
+					} catch (Throwable e) {
+						// Returned value is deliberately ignored
+						promise.setFailure(e);
+						WIP.decrementAndGet(this);
+						return;
+					}
+
+					if (vr == null) {
+						// Returned value is deliberately ignored
+						promise.setSuccess();
+						WIP.decrementAndGet(this);
+						return;
+					}
+
+					if (inner.unbounded) {
+						// Returned value is deliberately ignored
+						doWrite(vr, promise, null);
+					} else {
+						innerActive = true;
+						inner.promise = promise;
+						inner.onSubscribe(Operators.scalarSubscription(inner, vr));
+					}
+				} else {
+					innerActive = true;
+					inner.promise = promise;
+					p.subscribe(inner);
+				}
+			}
+			else {
+				// Returned value is deliberately ignored
+				doWrite(message, promise, null);
+			}
+			WIP.compareAndSet(this, 1, 0);
 		}
 	}
 
@@ -488,6 +446,7 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		volatile long         missedRequested;
 		volatile long         missedProduced;
 		volatile int          wip;
+		volatile int          pendingWrites;
 
 		boolean        inactive;
 		/**
@@ -501,7 +460,7 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		Subscription   actual;
 		long           produced;
 		ChannelPromise promise;
-		ChannelFuture  lastWrite;
+		ChannelPromise  lastWrite;
 		boolean        lastThreadInEventLoop;
 
 		PublisherSender(ChannelOperationsHandler parent) {
@@ -541,8 +500,9 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		@SuppressWarnings("FutureReturnValueIgnored")
 		public void onComplete() {
 			long p = produced;
-			ChannelFuture f = lastWrite;
+			ChannelPromise f = lastWrite;
 			parent.innerActive = false;
+			ChannelOperationsHandler.WIP.compareAndSet(parent, 1, 0);
 
 			if (p != 0L) {
 				if (parent.pendingBytes > 0L || parent.hasPendingWriteBytes() || !lastThreadInEventLoop) {
@@ -568,22 +528,8 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 
 			if (f != null) {
 				if (!f.isDone() && (parent.hasPendingWriteBytes() || !lastThreadInEventLoop)) {
-					EventLoop eventLoop = parent.ctx.channel().eventLoop();
-					if (eventLoop.inEventLoop()) {
-						if (!parent.pendingWriteOffer.test(f, PENDING_WRITES) && f instanceof ChannelPromise) {
-							// Returned value is deliberately ignored
-							((ChannelPromise) f).setFailure(new IllegalStateException("Send Queue full?!"));
-						}
-					}
-					else {
-						eventLoop.execute(() -> {
-							if (!f.isDone() && parent.hasPendingWriteBytes()) {
-								if (!parent.pendingWriteOffer.test(f, PENDING_WRITES) && f instanceof ChannelPromise) {
-									// Returned value is deliberately ignored
-									((ChannelPromise) f).setFailure(new IllegalStateException("Send Queue full?!"));
-								}
-							}
-						});
+					if (!PENDING_WRITES.compareAndSet(this,0, 1)) {
+						f.setFailure(new IllegalStateException("Cannot flush the pending writes"));
 					}
 				}
 				f.addListener(this);
@@ -601,8 +547,9 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		@SuppressWarnings("FutureReturnValueIgnored")
 		public void onError(Throwable t) {
 			long p = produced;
-			ChannelFuture f = lastWrite;
+			ChannelPromise f = lastWrite;
 			parent.innerActive = false;
+			ChannelOperationsHandler.WIP.compareAndSet(parent, 1, 0);
 
 			if (p != 0L) {
 				if (parent.ctx.channel()
@@ -625,25 +572,15 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 
 			if (f != null) {
 				if (!f.isDone() && (parent.hasPendingWriteBytes() || !lastThreadInEventLoop)) {
-					EventLoop eventLoop = parent.ctx.channel().eventLoop();
-					if (eventLoop.inEventLoop()) {
-						if (!parent.pendingWriteOffer.test(f, PENDING_WRITES) && f instanceof ChannelPromise) {
-							// Returned value is deliberately ignored
-							((ChannelPromise) f).setFailure(new IllegalStateException("Send Queue full?!"));
-						}
-					}
-					else {
-						eventLoop.execute(() -> {
-							if (!parent.pendingWriteOffer.test(f, PENDING_WRITES) && f instanceof ChannelPromise) {
-								// Returned value is deliberately ignored
-								((ChannelPromise) f).setFailure(new IllegalStateException("Send Queue full?!"));
-							}
-						});
+					if (!PENDING_WRITES.compareAndSet(this,0, 1)) {
+						f.setFailure(new IllegalStateException("Cannot flush the pending writes"));
 					}
 				}
 				f.addListener(future -> {
 					produced = 0L;
 					produced(p);
+					PublisherSender.PENDING_WRITES.compareAndSet(this, 1, 0);
+					ChannelOperationsHandler.WIP.compareAndSet(parent, 1, 0);
 					if (!future.isSuccess()) {
 						// Returned value is deliberately ignored
 						promise.setFailure(Exceptions.addSuppressed(future.cause(), t));
@@ -708,12 +645,12 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 
 		@Override
 		public void onSubscribe(Subscription s) {
+			Objects.requireNonNull(s);
+
 			if (inactive) {
 				s.cancel();
 				return;
 			}
-
-			Objects.requireNonNull(s);
 
 			if (wip == 0 && WIP.compareAndSet(this, 0, 1)) {
 				actual = s;
@@ -741,6 +678,8 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 			long p = produced;
 			produced = 0L;
 			produced(p);
+			PublisherSender.PENDING_WRITES.compareAndSet(this, 1, 0);
+			ChannelOperationsHandler.WIP.compareAndSet(parent, 1, 0);
 			if (future.isSuccess()) {
 				// Returned value is deliberately ignored
 				promise.setSuccess();
@@ -932,7 +871,9 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 		static final AtomicIntegerFieldUpdater<PublisherSender> WIP                 =
 				AtomicIntegerFieldUpdater.newUpdater(PublisherSender.class, "wip");
 
-		private static final PendingWritesOnCompletion PENDING_WRITES = new PendingWritesOnCompletion();
+		static final AtomicIntegerFieldUpdater<PublisherSender> PENDING_WRITES                 =
+				AtomicIntegerFieldUpdater.newUpdater(PublisherSender.class, "pendingWrites");
+		private static final PendingWritesOnCompletion PENDING_WRITES_MESSAGE = new PendingWritesOnCompletion();
 	}
 
 	@SuppressWarnings("rawtypes")
@@ -940,11 +881,9 @@ final class ChannelOperationsHandler extends ChannelDuplexHandler
 			AtomicIntegerFieldUpdater.newUpdater(ChannelOperationsHandler.class, "wip");
 	static final AtomicLongFieldUpdater<ChannelOperationsHandler> SCHEDULED_FLUSH =
 			AtomicLongFieldUpdater.newUpdater(ChannelOperationsHandler.class, "scheduledFlush");
+	static final AtomicReference<ChannelPromise> TERMINATED_OPERATIONS = new AtomicReference<>();
 	static final Logger                                              log =
 			Loggers.getLogger(ChannelOperationsHandler.class);
-
-	static final BiConsumer<?, ? super ByteBuf> NOOP_ENCODER = (a, b) -> {
-	};
 
 	private static final class PendingWritesOnCompletion {
 		@Override

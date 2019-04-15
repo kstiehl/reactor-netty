@@ -543,7 +543,7 @@ public class TcpClientTests {
 				                               allWrites.add(out.sendString(Flux.just("a")
 				                                                                .delayElements(Duration.ofMillis(750))));
 			                               }
-			                               return Flux.merge(allWrites);
+			                               return Flux.concat(allWrites);
 		                               })
 		                             .wiretap(true)
 		                             .connectNow();
