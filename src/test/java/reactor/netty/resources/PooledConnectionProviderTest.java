@@ -31,13 +31,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.pool.ChannelPool;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.util.concurrent.Future;
-import io.netty.util.concurrent.Promise;
 import org.junit.Before;
 import org.junit.Test;
 import reactor.core.publisher.Flux;
@@ -50,91 +45,69 @@ import reactor.netty.resources.PooledConnectionProvider.PooledConnection;
 import reactor.netty.tcp.TcpClient;
 import reactor.netty.tcp.TcpClientTests;
 import reactor.netty.tcp.TcpServer;
+import reactor.pool.InstrumentedPool;
+import reactor.pool.PooledRef;
 import reactor.test.StepVerifier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class PooledConnectionProviderTest {
 
-	private AtomicInteger closed;
-	private ChannelPool channelPool;
+	private InstrumentedPool<PooledConnection> channelPool;
 
 	@Before
 	public void before() {
-		closed = new AtomicInteger();
-		channelPool = new ChannelPool() {
-			@Override
-			public Future<Channel> acquire() {
-				return null;
-			}
-
-			@Override
-			public Future<Channel> acquire(Promise<Channel> promise) {
-				return null;
-			}
-
-			@Override
-			public Future<Void> release(Channel channel) {
-				return null;
-			}
-
-			@Override
-			public Future<Void> release(Channel channel, Promise<Void> promise) {
-				return null;
-			}
-
-			@Override
-			public void close() {
-				closed.incrementAndGet();
-			}
-		};
+		channelPool = new PoolImpl();
 	}
 
 	@Test
 	public void disposeLaterDefers() {
-		PooledConnectionProvider.Pool pool = new PooledConnectionProvider.Pool(
-				new Bootstrap().group(new DefaultEventLoopGroup()),
-				(b, handler, checker) -> channelPool, ChannelOperations.OnSetup.empty());
+		PooledConnectionProvider.PooledConnectionAllocator pooledConnectionAllocator =
+				new PooledConnectionProvider.PooledConnectionAllocator(
+						new Bootstrap(),
+						(allocator, destroyHandler, evictionPredicate) ->
+								channelPool, ChannelOperations.OnSetup.empty());
 
 		PooledConnectionProvider poolResources = new PooledConnectionProvider("test",
-				(b, handler, checker) -> channelPool);
+				(allocator, destroyHandler, evictionPredicate) -> channelPool);
 		//"register" our fake Pool
 		poolResources.channelPools.put(
 				new PooledConnectionProvider.PoolKey(
 						InetSocketAddress.createUnresolved("localhost", 80), -1),
-				pool);
+				pooledConnectionAllocator.pool);
 
 		Mono<Void> disposer = poolResources.disposeLater();
-		assertThat(closed.get()).as("pool closed by disposeLater()").isEqualTo(0);
+		assertThat(((AtomicInteger) channelPool).get()).as("pool closed by disposeLater()").isEqualTo(0);
 
 		disposer.subscribe();
-		assertThat(closed.get()).as("pool closed by disposer subscribe()").isEqualTo(1);
+		assertThat(((AtomicInteger) channelPool).get()).as("pool closed by disposer subscribe()").isEqualTo(1);
 	}
 
 	@Test
 	public void disposeOnlyOnce() {
-		PooledConnectionProvider.Pool pool = new PooledConnectionProvider.Pool(
-				new Bootstrap().group(new DefaultEventLoopGroup()),
-				(b, handler, checker) -> channelPool, ChannelOperations.OnSetup.empty()
-				);
+		PooledConnectionProvider.PooledConnectionAllocator pooledConnectionAllocator =
+				new PooledConnectionProvider.PooledConnectionAllocator(
+						new Bootstrap(),
+						(allocator, destroyHandler, evictionPredicate) ->
+								channelPool, ChannelOperations.OnSetup.empty());
 
 		PooledConnectionProvider poolResources = new PooledConnectionProvider("test",
-				(b, handler, checker) -> channelPool);
+				(allocator, destroyHandler, evictionPredicate) -> channelPool);
 		//"register" our fake Pool
 		poolResources.channelPools.put(
 				new PooledConnectionProvider.PoolKey(
 						InetSocketAddress.createUnresolved("localhost", 80), -1),
-				pool);
+				pooledConnectionAllocator.pool);
 
 		poolResources.dispose();
-		assertThat(closed.get()).as("pool closed by dispose()").isEqualTo(1);
+		assertThat(((AtomicInteger) channelPool).get()).as("pool closed by dispose()").isEqualTo(1);
 
 		Mono<Void> disposer = poolResources.disposeLater();
 		disposer.subscribe();
 		poolResources.disposeLater().subscribe();
 		poolResources.dispose();
 
-		assertThat(closed.get()).as("pool closed only once").isEqualTo(1);
+		assertThat(((AtomicInteger) channelPool).get()).as("pool closed only once").isEqualTo(1);
 	}
 
 	@Test
@@ -168,10 +141,10 @@ public class PooledConnectionProviderTest {
 
 			//acquire 2
 			final PooledConnection c1 = (PooledConnection) pool.acquire(bootstrap)
-			                                                   .block();
+			                                                   .block(Duration.ofSeconds(30));
 			assertThat(c1).isNotNull();
 			final PooledConnection c2 = (PooledConnection) pool.acquire(bootstrap)
-			                                                   .block();
+			                                                   .block(Duration.ofSeconds(30));
 			assertThat(c2).isNotNull();
 
 			//make room for 1 more
@@ -179,7 +152,7 @@ public class PooledConnectionProviderTest {
 
 
 			final PooledConnection c3 = (PooledConnection) pool.acquire(bootstrap)
-			                                                   .block();
+			                                                   .block(Duration.ofSeconds(30));
 			assertThat(c3).isNotNull();
 
 			//next one will block until a previous one is released
@@ -189,7 +162,7 @@ public class PooledConnectionProviderTest {
 
 
 			final PooledConnection c4 = (PooledConnection) pool.acquire(bootstrap)
-			                                                   .block();
+			                                                   .block(Duration.ofSeconds(30));
 			assertThat(c4).isNotNull();
 
 			long end = System.currentTimeMillis();
@@ -208,11 +181,11 @@ public class PooledConnectionProviderTest {
 			                   .isEqualTo(c3.pool)
 			                   .isEqualTo(c4.pool);
 
-			PooledConnectionProvider.Pool defaultPool = c1.pool;
+			InstrumentedPool<PooledConnection> defaultPool = c1.pool;
 
 			CountDownLatch latch = new CountDownLatch(1);
 			f2 = service.submit(() -> {
-				while(defaultPool.activeConnections.get() > 0) {
+				while(defaultPool.metrics().acquiredSize() > 0) {
 					LockSupport.parkNanos(100);
 				}
 				latch.countDown();
@@ -247,13 +220,14 @@ public class PooledConnectionProviderTest {
 
 		CountDownLatch latch = new CountDownLatch(1);
 		PooledConnectionProvider provider = (PooledConnectionProvider) ConnectionProvider.fixed("test", 1, 20);
-		AtomicReference<PooledConnectionProvider.Pool> pool = new AtomicReference<>();
+		AtomicReference<InstrumentedPool<PooledConnection>> pool = new AtomicReference<>();
 		Flux.range(0, 5)
 		    .flatMap(i ->
 		        TcpClient.create(provider)
 		                 .port(server.port())
 		                 .doOnConnected(conn -> {
-		                     ConcurrentMap<PooledConnectionProvider.PoolKey, PooledConnectionProvider.Pool> pools = provider.channelPools;
+		                     ConcurrentMap<PooledConnectionProvider.PoolKey, InstrumentedPool<PooledConnection>> pools =
+		                             provider.channelPools;
 		                     pool.set(pools.get(pools.keySet().toArray()[0]));
 		                     conn.channel()
 		                         .closeFuture()
@@ -266,48 +240,34 @@ public class PooledConnectionProviderTest {
 
 		assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 
-		assertThat(pool.get().activeConnections.get()).isEqualTo(0);
-		assertThat(pool.get().inactiveConnections.get()).isEqualTo(0);
+		assertThat(pool.get().metrics().acquiredSize()).isEqualTo(0);
+		assertThat(pool.get().metrics().idleSize()).isEqualTo(0);
 
 		server.disposeNow();
 		provider.dispose();
 	}
 
-	@Test
-	public void testIssue673_IllegalStateException() throws InterruptedException {
-		DisposableServer server =
-				TcpServer.create()
-				         .port(0)
-				         .handle((in, out) -> out.sendString(Mono.just("test")))
-				         .wiretap(true)
-				         .bindNow();
 
-		CountDownLatch latch = new CountDownLatch(1);
-		PooledConnectionProvider provider = (PooledConnectionProvider) ConnectionProvider.fixed("test", 1);
-		AtomicReference<PooledConnectionProvider.Pool> pool = new AtomicReference<>();
-		Flux.range(0, 2)
-		    .flatMap(i ->
-		        TcpClient.create(provider)
-		                 .port(server.port())
-		                 .doOnConnected(conn -> {
-		                     ConcurrentMap<PooledConnectionProvider.PoolKey, PooledConnectionProvider.Pool> pools = provider.channelPools;
-		                     pool.set(pools.get(pools.keySet().toArray()[0]));
-		                     provider.disposeLater()
-		                             .block(Duration.ofSeconds(30));
-		                     conn.channel()
-		                         .closeFuture()
-		                         .addListener(future -> latch.countDown());
-		                 })
-		                 .handle((in, out) -> in.receive().then())
-		                 .wiretap(true)
-		                 .connect())
-		    .subscribe(null, t -> assertThat(t instanceof IllegalStateException).isTrue());
+	static final class PoolImpl extends AtomicInteger implements InstrumentedPool<PooledConnection> {
 
-		assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
+		@Override
+		public Mono<PooledRef<PooledConnection>> acquire() {
+			return Mono.empty();
+		}
 
-		assertThat(pool.get().activeConnections.get()).isEqualTo(0);
-		assertThat(pool.get().inactiveConnections.get()).isEqualTo(0);
+		@Override
+		public Mono<PooledRef<PooledConnection>> acquire(Duration timeout) {
+			return null;
+		}
 
-		server.disposeNow();
+		@Override
+		public void dispose() {
+			incrementAndGet();
+		}
+
+		@Override
+		public PoolMetrics metrics() {
+			return null;
+		}
 	}
 }
