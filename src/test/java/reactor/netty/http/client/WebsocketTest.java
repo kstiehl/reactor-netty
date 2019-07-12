@@ -50,6 +50,8 @@ import reactor.netty.http.websocket.WebsocketInbound;
 import reactor.netty.http.websocket.WebsocketOutbound;
 import reactor.netty.resources.ConnectionProvider;
 import reactor.test.StepVerifier;
+import reactor.util.Logger;
+import reactor.util.Loggers;
 import reactor.util.function.Tuple2;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -62,6 +64,8 @@ import static org.hamcrest.CoreMatchers.is;
 public class WebsocketTest {
 
 	static final String auth = "bearer abc";
+
+	static final Logger log = Loggers.getLogger(WebsocketTest.class);
 
 	DisposableServer httpServer = null;
 
@@ -150,7 +154,7 @@ public class WebsocketTest {
 //		                       .flatMapMany(in -> in.receiveWebsocket()
 //		                                        .receive()
 //		                                        .asByteArray())
-//		                       .doOnNext(d -> System.out.println(d.length))
+//		                       .doOnNext(d -> log.debug(d.length))
 //		                       .log()
 //		                       .subscribe();
 //
@@ -163,8 +167,7 @@ public class WebsocketTest {
 		httpServer = HttpServer.create()
 		                       .port(0)
 		                       .handle((in, out) -> out.sendWebsocket(
-				                       (i, o) -> o.options(NettyPipeline.SendOptions::flushOnEach)
-				                                  .sendString(
+				                       (i, o) -> o.sendString(
 						                                  Mono.just("test")
 						                                      .delayElement(Duration.ofMillis(100))
 						                                      .repeat())))
@@ -203,11 +206,10 @@ public class WebsocketTest {
 				HttpServer.create()
 				          .port(0)
 				          .route(r -> r.get("/test/{param}", (req, res) -> {
-					          System.out.println(req.requestHeaders().get("test"));
+					          log.debug(req.requestHeaders().get("test"));
 					          return res.header("content-type", "text/plain")
 					                    .sendWebsocket((in, out) ->
-							                    out.options(NettyPipeline.SendOptions::flushOnEach)
-							                       .sendString(in.receive()
+							                    out.sendString(in.receive()
 							                                     .asString()
 							                                     .publishOn(Schedulers.single())
 							                                     .doOnNext(s -> serverRes.incrementAndGet())
@@ -227,8 +229,6 @@ public class WebsocketTest {
 				      .websocket() //TODO investigate why get not working
 				      .uri("/test/World")
 				      .handle((i, o) -> {
-					      o.options(NettyPipeline.SendOptions::flushOnEach);
-
 					      o.sendString(Flux.range(1, 1000)
 					                       .log("client-send")
 					                       .map(it -> "" + it), Charset.defaultCharset())
@@ -246,14 +246,14 @@ public class WebsocketTest {
 				      .cache()
 				      .doOnError(i -> System.err.println("Failed requesting server: " + i));
 
-		System.out.println("STARTING: server[" + serverRes.get() + "] / client[" + clientRes.get() + "]");
+		log.debug("STARTING: server[" + serverRes.get() + "] / client[" + clientRes.get() + "]");
 
 		StepVerifier.create(response)
 		            .expectNextMatches(list -> "1000 World!".equals(list.get(999)))
 		            .expectComplete()
 		            .verify();
 
-		System.out.println("FINISHED: server[" + serverRes.get() + "] / client[" + clientRes + "]");
+		log.debug("FINISHED: server[" + serverRes.get() + "] / client[" + clientRes + "]");
 	}
 
 	@Test
@@ -262,8 +262,7 @@ public class WebsocketTest {
 		httpServer = HttpServer.create()
 		                       .port(0)
 		                       .handle((in, out) -> out.sendWebsocket(
-				                       (i, o) -> o.options(NettyPipeline.SendOptions::flushOnEach)
-				                                  .sendByteArray(
+				                       (i, o) -> o.sendByteArray(
 						                                  Mono.just("test".getBytes(Charset.defaultCharset()))
 						                                      .delayElement(Duration.ofMillis(100))
 						                                      .repeat())))
@@ -328,8 +327,7 @@ public class WebsocketTest {
 		          .wiretap(true)
 		          .websocket()
 		          .uri("/test")
-		          .handle((i, o) -> o.options(NettyPipeline.SendOptions::flushOnEach)
-		                             .sendString(i.receive()
+		          .handle((i, o) -> o.sendString(i.receive()
 		                                          .asString()
 		                                          .subscribeWith(client)))
 		          .log()
@@ -591,8 +589,7 @@ public class WebsocketTest {
 				HttpServer.create()
 						.port(0)
 						.handle((req, res) -> res.sendWebsocket(null, maxFramePayloadLength, (in, out) ->
-								out.options(NettyPipeline.SendOptions::flushOnEach)
-										.sendObject(in.aggregateFrames()
+								out.sendObject(in.aggregateFrames()
 												.receiveFrames()
 												.map(WebSocketFrame::content)
 												.map(byteBuf ->
@@ -628,8 +625,7 @@ public class WebsocketTest {
 		httpServer = HttpServer.create()
 		                       .port(0)
 		                       .handle((in, out) -> out.sendWebsocket(
-				                       (i, o) -> o.options(NettyPipeline.SendOptions::flushOnEach)
-				                                  .sendString(
+				                       (i, o) -> o.sendString(
 						                                  Mono.just("test")
 						                                      .delayElement(Duration.ofMillis(100))
 						                                      .repeat())))
@@ -721,8 +717,7 @@ public class WebsocketTest {
 	@Test
 	public void testConnectionAliveWhenTransformationErrors_1() {
 		doTestConnectionAliveWhenTransformationErrors((in, out) ->
-		        out.options(NettyPipeline.SendOptions::flushOnEach)
-		           .sendObject(in.aggregateFrames()
+		        out.sendObject(in.aggregateFrames()
 		                         .receiveFrames()
 		                         .map(WebSocketFrame::content)
 		                         //.share()
@@ -739,8 +734,7 @@ public class WebsocketTest {
 	@Test
 	public void testConnectionAliveWhenTransformationErrors_2() {
 		doTestConnectionAliveWhenTransformationErrors((in, out) ->
-		        out.options(NettyPipeline.SendOptions::flushOnEach)
-		           .sendObject(in.aggregateFrames()
+		        out.sendObject(in.aggregateFrames()
 		                         .receiveFrames()
 		                         .map(WebSocketFrame::content)
 		                         .concatMap(content ->
@@ -789,8 +783,7 @@ public class WebsocketTest {
 				HttpServer.create()
 				          .port(0)
 				          .handle((req, res) ->
-				              res.options(NettyPipeline.SendOptions::flushOnEach)
-				                 .sendWebsocket((in, out) ->
+				              res.sendWebsocket((in, out) ->
 				                     out.sendString(Flux.interval(Duration.ofSeconds(1))
 				                                        .map(l -> l + ""))))
 				          .bindNow();
@@ -805,7 +798,7 @@ public class WebsocketTest {
 			          Mono.delay(Duration.ofSeconds(3))
 			              .delayUntil(i -> out.sendClose())
 			              .subscribe(c -> {
-				              System.out.println("context.dispose()");
+				              log.debug("context.dispose()");
 				              latch.countDown();
 			              });
 		              in.withConnection(conn ->
@@ -818,7 +811,7 @@ public class WebsocketTest {
 		                                  error.set(true);
 		                              },
 		                              () -> {
-		                                  System.out.println("context.onClose() completed");
+		                                  log.debug("context.onClose() completed");
 		                                  latch.countDown();
 		                              }));
 		                  Mono.delay(Duration.ofSeconds(3))
@@ -826,7 +819,7 @@ public class WebsocketTest {
 		                          AtomicBoolean disposed = new AtomicBoolean(false);
 		                          in.withConnection(conn -> {
 		                              disposed.set(conn.isDisposed());
-		                              System.out.println("context.isDisposed() " + conn.isDisposed());
+		                              log.debug("context.isDisposed() " + conn.isDisposed());
 		                          });
 		                          if (disposed.get()) {
 		                              latch.countDown();
@@ -851,8 +844,7 @@ public class WebsocketTest {
 				HttpServer.create()
 				          .port(0)
 				          .handle((req, res) ->
-				              res.options(NettyPipeline.SendOptions::flushOnEach)
-				                 .sendWebsocket((in, out) ->
+				              res.sendWebsocket((in, out) ->
 				                     out.sendString(Flux.interval(Duration.ofSeconds(1))
 				                                        .map(l -> l + ""))))
 				          .bindNow();
@@ -867,7 +859,7 @@ public class WebsocketTest {
 		              in.withConnection(conn -> {
 		                  Mono.delay(Duration.ofSeconds(3))
 		                      .subscribe(c -> {
-		                              System.out.println("context.dispose()");
+		                              log.debug("context.dispose()");
 		                              conn.dispose();
 		                              latch.countDown();
 		                      });
@@ -880,7 +872,7 @@ public class WebsocketTest {
 		                                     error.set(true);
 		                                 },
 		                                 () -> {
-		                                     System.out.println("context.onClose() completed");
+		                                     log.debug("context.onClose() completed");
 		                                     latch.countDown();
 		                                 });
 		              });
@@ -889,7 +881,7 @@ public class WebsocketTest {
 		                          AtomicBoolean disposed = new AtomicBoolean(false);
 		                          in.withConnection(conn -> {
 		                              disposed.set(conn.isDisposed());
-		                              System.out.println("context.isDisposed() " + conn.isDisposed());
+		                              log.debug("context.isDisposed() " + conn.isDisposed());
 		                          });
 		                          if (disposed.get()) {
 		                              latch.countDown();
@@ -936,7 +928,7 @@ public class WebsocketTest {
 		                                 error.set(true);
 		                             },
 		                             () -> {
-		                                 System.out.println("context.onClose() completed");
+		                                 log.debug("context.onClose() completed");
 		                                 latch.countDown();
 		                             }));
 		              Mono.delay(Duration.ofSeconds(3))
@@ -944,7 +936,7 @@ public class WebsocketTest {
 		                      AtomicBoolean disposed = new AtomicBoolean(false);
 		                      in.withConnection(conn -> {
 		                          disposed.set(conn.isDisposed());
-		                          System.out.println("context.isDisposed() " + conn.isDisposed());
+		                          log.debug("context.isDisposed() " + conn.isDisposed());
 		                      });
 		                      if (disposed.get()) {
 		                          latch.countDown();
@@ -993,8 +985,7 @@ public class WebsocketTest {
 				                   .onErrorResume(ex -> out.sendClose(1001, "Going Away"))
 				                   .cast(WebSocketFrame.class)));
 		doTestIssue444((in, out) ->
-				out.options(o -> o.flushOnEach(false))
-				   .send(Flux.range(0, 10)
+				out.send(Flux.range(0, 10)
 				             .map(i -> {
 				                 if (i == 5) {
 				                     out.sendClose(1001, "Going Away").subscribe();

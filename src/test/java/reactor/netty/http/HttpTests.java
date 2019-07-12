@@ -148,12 +148,12 @@ public class HttpTests {
 		DisposableServer server =
 				HttpServer.create()
 				          .port(0)
-						  .route(r -> r.get("/test", (req, res) -> {throw new RuntimeException();})
-						               .get("/test2", (req, res) -> res.send(Flux.error(new Exception()))
+						  .route(r -> r.get("/test", (req, res) -> {throw new RuntimeException("test");})
+						               .get("/test2", (req, res) -> res.send(Flux.error(new Exception("test2")))
 						                                                 .then()
 						                                                 .log("send-1")
 						                                                 .doOnError(t -> errored1.countDown()))
-						               .get("/test3", (req, res) -> Flux.error(new Exception()))
+						               .get("/test3", (req, res) -> Flux.error(new Exception("test3")))
 						               .get("/issue231_1", (req, res) -> res.send(flux1)
 						                                                      .then()
 						                                                      .log("send-2")
@@ -366,7 +366,6 @@ public class HttpTests {
 				                       .get("/stream", (req, res) ->
 						                           req.receive()
 						                              .then(res.compression(true)
-						                                       .options(NettyPipeline.SendOptions::flushOnEach)
 						                                       .sendString(ep.log()).then())))
 				          .wiretap(true)
 				          .bindNow();
@@ -440,8 +439,7 @@ public class HttpTests {
 				                                                                  .sendString(Flux.just("test")).then()))
 				                       .get("/stream", (req, res) ->
 						                           req.receive()
-						                              .then(res.options(NettyPipeline.SendOptions::flushOnEach)
-						                                       .sendString(ep.log()).then())))
+						                              .then(res.sendString(ep.log()).then())))
 				          .wiretap(true)
 				          .bindNow();
 
@@ -724,7 +722,7 @@ public class HttpTests {
 				          .protocol(HttpProtocol.H2, HttpProtocol.HTTP11)
 				          .secure(ssl -> ssl.sslContext(serverOptions))
 				          .port(8080)
-				          .handle((req, res) -> res.sendString(Mono.just("Hello")))
+				          .handle((req, res) -> res.sendString(req.receive().aggregate().retain().asString()))
 				          .wiretap(true)
 				          .bindNow();
 

@@ -26,6 +26,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.util.IllegalReferenceCountException;
 import reactor.core.CoreSubscriber;
+import reactor.core.Fuseable;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.MonoOperator;
 
@@ -35,7 +36,7 @@ import reactor.core.publisher.MonoOperator;
  *
  * @author Stephane Maldini
  */
-public final class ByteBufMono extends MonoOperator<ByteBuf, ByteBuf> {
+public class ByteBufMono extends MonoOperator<ByteBuf, ByteBuf> {
 
 	/**
 	 * a {@link ByteBuffer} inbound {@link Mono}
@@ -100,10 +101,14 @@ public final class ByteBufMono extends MonoOperator<ByteBuf, ByteBuf> {
 
 	/**
 	 * Convert to an {@link InputStream} inbound {@link Mono}
+	 * <p>Note: Auto memory release is disabled. The underlying
+	 * {@link ByteBuf} will be released only when {@link InputStream#close()}
+	 * is invoked. Ensure {@link InputStream#close()} is invoked
+	 * for any terminal signal: {@code complete} | {@code error} | {@code cancel}</p>
 	 *
 	 * @return a {@link InputStream} inbound {@link Mono}
 	 */
-	public Mono<InputStream> asInputStream() {
+	public final Mono<InputStream> asInputStream() {
 		return handle((bb, sink) -> {
 			try {
 				sink.next(new ReleasingInputStream(bb));
@@ -120,8 +125,8 @@ public final class ByteBufMono extends MonoOperator<ByteBuf, ByteBuf> {
 	 *
 	 * @return {@link ByteBufMono} of retained {@link ByteBuf}
 	 */
-	public ByteBufMono retain() {
-		return new ByteBufMono(doOnNext(ByteBuf::retain));
+	public final ByteBufMono retain() {
+		return maybeFuse(doOnNext(ByteBuf::retain));
 	}
 
 	@Override
@@ -129,8 +134,22 @@ public final class ByteBufMono extends MonoOperator<ByteBuf, ByteBuf> {
 		source.subscribe(actual);
 	}
 
-	protected ByteBufMono(Mono<?> source) {
+	ByteBufMono(Mono<?> source) {
 		super(source.map(ByteBufFlux.bytebufExtractor));
+	}
+
+	static ByteBufMono maybeFuse(Mono<?> source) {
+		if (source instanceof Fuseable) {
+			return new ByteBufMonoFuseable(source);
+		}
+		return new ByteBufMono(source);
+	}
+
+	static final class ByteBufMonoFuseable extends ByteBufMono implements Fuseable {
+
+		ByteBufMonoFuseable(Mono<?> source) {
+			super(source);
+		}
 	}
 
 	static final class ReleasingInputStream extends ByteBufInputStream {

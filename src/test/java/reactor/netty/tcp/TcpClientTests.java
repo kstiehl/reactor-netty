@@ -58,10 +58,10 @@ import reactor.netty.NettyOutbound;
 import reactor.netty.SocketUtils;
 import reactor.netty.channel.AbortedException;
 import reactor.netty.channel.ChannelOperations;
-import reactor.netty.http.client.HttpClient;
 import reactor.netty.resources.ConnectionProvider;
 import reactor.netty.resources.LoopResources;
 import reactor.test.StepVerifier;
+import reactor.util.Logger;
 import reactor.util.Loggers;
 
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -74,6 +74,8 @@ import static org.junit.Assert.*;
  * @since 2.5
  */
 public class TcpClientTests {
+
+	static final Logger log = Loggers.getLogger(TcpClientTests.class);
 
 	private final ExecutorService threadPool = Executors.newCachedThreadPool();
 	int                     echoServerPort;
@@ -303,7 +305,7 @@ public class TcpClientTests {
 				         .wiretap(true)
 				         .connectNow(Duration.ofSeconds(30));
 
-		System.out.println("Connected");
+		log.debug("Connected");
 
 		c.onDispose()
 		 .log()
@@ -399,7 +401,7 @@ public class TcpClientTests {
 					         .port(abortServerPort);
 
 			Mono<? extends Connection> handler = tcpClient.handle((in, out) -> {
-				System.out.println("Start");
+				log.debug("Start");
 				connectionLatch.countDown();
 				in.receive()
 				  .subscribe();
@@ -534,7 +536,7 @@ public class TcpClientTests {
 		                             .host("localhost")
 		                             .port(echoServerPort)
 		                             .handle((in, out) -> {
-			                               System.out.println("hello");
+			                               log.debug("hello");
 			                               out.withConnection(c -> c.onWriteIdle(500, latch::countDown));
 
 			                               List<Publisher<Void>> allWrites =
@@ -548,7 +550,7 @@ public class TcpClientTests {
 		                             .wiretap(true)
 		                             .connectNow();
 
-		System.out.println("Started");
+		log.debug("Started");
 
 		assertTrue(latch.await(5, TimeUnit.SECONDS));
 
@@ -559,25 +561,8 @@ public class TcpClientTests {
 	}
 
 	@Test
-	public void nettyNetChannelAcceptsNettyChannelHandlers() throws InterruptedException {
-		HttpClient client = HttpClient.create()
-		                              .wiretap(true);
-
-		final CountDownLatch latch = new CountDownLatch(1);
-		System.out.println(client.get()
-		                         .uri("http://www.google.com/?q=test%20d%20dq")
-		                         .responseContent()
-		                         .asString()
-		                         .collectList()
-		                         .doOnSuccess(v -> latch.countDown())
-		                         .block(Duration.ofSeconds(30)));
-
-		assertTrue("Latch didn't time out", latch.await(15, TimeUnit.SECONDS));
-	}
-
-	@Test
 	public void gettingOptionsDuplicates() {
-		TcpClient client = TcpClient.create().host("foo").port(123);
+		TcpClient client = TcpClient.create().host("example.com").port(123);
 		Assertions.assertThat(client.configure())
 		          .isNotSameAs(TcpClient.DEFAULT_BOOTSTRAP)
 		          .isNotSameAs(client.configure());
@@ -672,7 +657,7 @@ public class TcpClientTests {
 				countDown();
 				while (true) {
 					SocketChannel ch = server.accept();
-					System.out.println("ABORTING");
+					log.debug("ABORTING");
 					ch.close();
 				}
 			}

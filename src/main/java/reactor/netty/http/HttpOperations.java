@@ -18,10 +18,16 @@ package reactor.netty.http;
 
 import java.nio.file.Path;
 import java.util.Objects;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelInboundHandler;
 import io.netty.channel.CombinedChannelDuplexHandler;
@@ -32,6 +38,7 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpMessage;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.LastHttpContent;
+import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.ConnectionObserver;
@@ -41,6 +48,9 @@ import reactor.netty.NettyOutbound;
 import reactor.netty.NettyPipeline;
 import reactor.netty.channel.AbortedException;
 import reactor.netty.channel.ChannelOperations;
+import reactor.util.Logger;
+import reactor.util.Loggers;
+import reactor.util.annotation.Nullable;
 
 /**
  * An HTTP ready {@link ChannelOperations} with state management for status and headers
@@ -85,6 +95,38 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 	}
 
 	@Override
+	@SuppressWarnings("unchecked")
+	public NettyOutbound send(Publisher<? extends ByteBuf> source) {
+		if (source instanceof Mono) {
+			return new PostHeadersNettyOutbound(((Mono<ByteBuf>)source)
+					.flatMap(msg -> {
+						if (markSentHeaderAndBody()) {
+							preSendHeadersAndStatus();
+							return FutureMono.from(channel().writeAndFlush(newFullBodyMessage(msg)));
+						}
+						return FutureMono.from(channel().writeAndFlush(msg));
+					})
+					.doOnDiscard(ByteBuf.class, ByteBuf::release), this, null);
+		}
+		return super.send(source);
+	}
+
+	@Override
+	public NettyOutbound sendObject(Object message) {
+		if (!(message instanceof ByteBuf)) {
+			return super.sendObject(message);
+		}
+		ByteBuf b = (ByteBuf) message;
+		return new PostHeadersNettyOutbound(FutureMono.deferFuture(() -> {
+			if (markSentHeaderAndBody()) {
+				preSendHeadersAndStatus();
+				return channel().writeAndFlush(newFullBodyMessage(b));
+			}
+			return channel().writeAndFlush(b);
+		}), this, b);
+	}
+
+	@Override
 	public Mono<Void> then() {
 		if (!channel().isActive()) {
 			return Mono.error(new AbortedException("Connection has been closed BEFORE response"));
@@ -103,7 +145,7 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 							.remove(HttpHeaderNames.TRANSFER_ENCODING);
 					if (HttpUtil.getContentLength(outboundHttpMessage(), 0) == 0) {
 						markSentBody();
-						msg = newFullEmptyBodyMessage();
+						msg = newFullBodyMessage(Unpooled.EMPTY_BUFFER);
 					}
 					else {
 						msg = outboundHttpMessage();
@@ -125,7 +167,7 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 
 	protected abstract void preSendHeadersAndStatus();
 
-	protected abstract HttpMessage newFullEmptyBodyMessage();
+	protected abstract HttpMessage newFullBodyMessage(ByteBuf body);
 
 	@Override
 	public final NettyOutbound sendFile(Path file, long position, long count) {
@@ -249,4 +291,76 @@ public abstract class HttpOperations<INBOUND extends NettyInbound, OUTBOUND exte
 				}
 			}
 	);
+	static final Logger log = Loggers.getLogger(HttpOperations.class);
+
+	protected static final class PostHeadersNettyOutbound implements NettyOutbound, Consumer<Throwable>, Runnable {
+
+		final Mono<Void> source;
+		final HttpOperations<?, ?> parent;
+		final ByteBuf msg;
+
+		public PostHeadersNettyOutbound(Mono<Void> source, HttpOperations<?, ?> parent, @Nullable ByteBuf msg) {
+			this.msg = msg;
+			if (msg != null) {
+				this.source = source.doOnError(this)
+				                    .doOnCancel(this);
+			}
+			else {
+				this.source = source;
+			}
+			this.parent = parent;
+		}
+
+		@Override
+		public void run() {
+			if (msg != null && msg.refCnt() > 0) {
+				msg.release();
+			}
+		}
+
+		@Override
+		public void accept(Throwable throwable) {
+			if (msg != null && msg.refCnt() > 0) {
+				msg.release();
+			}
+		}
+
+		@Override
+		public Mono<Void> then() {
+			return source;
+		}
+
+		@Override
+		public ByteBufAllocator alloc() {
+			return parent.alloc();
+		}
+
+		@Override
+		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+			return parent.send(dataStream, predicate);
+		}
+
+		@Override
+		public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
+			return parent.sendObject(dataStream, predicate);
+		}
+
+		@Override
+		public NettyOutbound sendObject(Object message) {
+			return parent.sendObject(message);
+		}
+
+		@Override
+		public <S> NettyOutbound sendUsing(Callable<? extends S> sourceInput,
+				BiFunction<? super Connection, ? super S, ?> mappedInput,
+				Consumer<? super S> sourceCleanup) {
+			return parent.sendUsing(sourceInput, mappedInput, sourceCleanup);
+		}
+
+		@Override
+		public NettyOutbound withConnection(Consumer<? super Connection> withConnection) {
+			return parent.withConnection(withConnection);
+		}
+	}
 }
+

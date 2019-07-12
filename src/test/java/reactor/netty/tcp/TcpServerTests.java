@@ -61,14 +61,11 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
-import org.reactivestreams.Processor;
 import org.reactivestreams.Publisher;
 import reactor.core.Exceptions;
-import reactor.core.publisher.EmitterProcessor;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.MonoProcessor;
-import reactor.core.publisher.WorkQueueProcessor;
 import reactor.core.scheduler.Schedulers;
 import reactor.netty.Connection;
 import reactor.netty.ConnectionObserver;
@@ -288,51 +285,6 @@ public class TcpServerTests {
 	}
 
 	@Test
-	@Ignore
-	public void test5() throws Exception {
-		//Hot stream of data, could be injected from anywhere
-		EmitterProcessor<String> broadcaster = EmitterProcessor.create();
-
-		//Get a reference to the tail of the operation pipeline (microbatching + partitioning)
-		final Processor<List<String>, List<String>> processor =
-				WorkQueueProcessor.<List<String>>builder().autoCancel(false).build();
-
-		broadcaster
-				//transform 10 data in a [] of 10 elements or wait up to 1 Second before emitting whatever the list contains
-				.bufferTimeout(10, Duration.ofSeconds(1))
-				.log("broadcaster")
-				.subscribe(processor);
-
-		//on a server dispatching data on the default shared dispatcher, and serializing/deserializing as string
-		//Listen for anything exactly hitting the root URI and route the incoming connection request to the callback
-		DisposableServer s = HttpServer.create()
-		                               .port(0)
-		                               .route(r -> r.get("/", (request, response) -> {
-		                                   //prepare a response header to be appended first before any reply
-		                                   response.addHeader("X-CUSTOM", "12345");
-		                                   //attach to the shared tail, take the most recent generated substream and merge it to the high level stream
-		                                   //returning a stream of String from each microbatch merged
-		                                   return response.sendString(Flux.from(processor)
-		                                                                  //split each microbatch data into individual data
-		                                                                  .flatMap(Flux::fromIterable)
-		                                                                  .take(Duration.ofSeconds(5))
-		                                                                  .concatWith(Flux.just("end\n")));
-		                               }))
-		                               .wiretap(true)
-		                               .bindNow();
-
-		assertNotNull(s);
-
-		for (int i = 0; i < 50; i++) {
-			Thread.sleep(500);
-			broadcaster.onNext(System.currentTimeMillis() + "\n");
-		}
-
-		s.disposeNow();
-
-	}
-
-	@Test
 	public void testIssue462() throws InterruptedException {
 
 		final CountDownLatch countDownLatch = new CountDownLatch(1);
@@ -403,7 +355,7 @@ public class TcpServerTests {
 
 	@Test
 	public void gettingOptionsDuplicates() {
-		TcpServer server = TcpServer.create().host("foo").port(123);
+		TcpServer server = TcpServer.create().host("example.com").port(123);
 		Assertions.assertThat(server.configure())
 		          .isNotSameAs(TcpServerBind.INSTANCE.serverBootstrap)
 		          .isNotSameAs(server.configure());
@@ -815,8 +767,7 @@ public class TcpServerTests {
 				         .doOnConnection(c -> c.addHandlerLast("codec",
 				                                               new LineBasedFrameDecoder(256)))
 				         .handle((in, out) ->
-				                 out.options(o -> o.flushOnEach(false))
-				                    .sendString(in.receive()
+				                 out.sendString(in.receive()
 				                                  .asString()
 				                                  .doOnNext(s -> {
 				                                      if ("4".equals(s)) {
@@ -834,8 +785,7 @@ public class TcpServerTests {
 				         .doOnConnected(c -> c.addHandlerLast("codec",
 				                                              new LineBasedFrameDecoder(256)))
 				         .handle((in, out) ->
-				                 out.options(sendOptions -> sendOptions.flushOnEach(false))
-				                    .sendString(Flux.just("1\n", "2\n", "3\n", "4\n"))
+				                 out.sendString(Flux.just("1\n", "2\n", "3\n", "4\n"))
 				                    .then(in.receive()
 				                            .asString()
 				                            .doOnNext(s -> {

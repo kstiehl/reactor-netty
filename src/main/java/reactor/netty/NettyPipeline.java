@@ -16,9 +16,7 @@
 
 package reactor.netty;
 
-import java.util.Objects;
 import java.util.function.BiConsumer;
-import java.util.function.Consumer;
 
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandler;
@@ -71,65 +69,6 @@ public interface NettyPipeline {
 	String WsCompressionHandler = LEFT + "wsCompressionHandler";
 	String ProxyProtocolDecoder = LEFT + "proxyProtocolDecoder";
 	String ProxyProtocolReader  = LEFT + "proxyProtocolReader";
-
-	/**
-	 * A builder for sending strategy, similar prefixed methods being mutually exclusive
-	 * (flushXxx, prefetchXxx, requestXxx).
-	 */
-	interface SendOptions {
-
-		/**
-		 * Makes the underlying channel flushes on a terminated {@link Publisher} (default).
-		 *
-		 * @return this {@link SendOptions}
-		 */
-		SendOptions flushOnBoundary();
-
-		/**
-		 * Makes the underlying channel flushes item by item.
-		 * Flush operation will be scheduled and executed at some time in the future.
-		 *
-		 * @return this {@link SendOptions}
-		 */
-		default SendOptions flushOnEach() {
-			return flushOnEach(true);
-		}
-
-		/**
-		 * Makes the underlying channel flushes item by item.
-		 * Whether flush operation is executed immediately after the write operation
-		 * or not is specified by {@code withEventLoop} parameter.
-		 *
-		 * @param withEventLoop flag specifying whether flush operation
-		 *                      will be executed immediately or at some time in the future
-		 * @return this {@link SendOptions}
-		 */
-		SendOptions flushOnEach(boolean withEventLoop);
-
-
-	}
-
-	/**
-	 * An container transporting a new {@link SendOptions}, eventually bound to a
-	 * specific {@link Publisher}
-	 */
-	final class SendOptionsChangeEvent {
-
-		final Consumer<? super SendOptions> configurator;
-
-		SendOptionsChangeEvent(Consumer<? super SendOptions> configurator) {
-			this.configurator = Objects.requireNonNull(configurator, "configurator");
-		}
-
-		/**
-		 * Return the send configurator
-		 *
-		 * @return the send configurator
-		 */
-		public Consumer<? super SendOptions> configurator() {
-			return configurator;
-		}
-	}
 
 	/**
 	 * Create a new {@link ChannelInboundHandler} that will invoke

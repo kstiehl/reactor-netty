@@ -63,7 +63,6 @@ import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.ReferenceCountUtil;
 import org.junit.Test;
 import org.reactivestreams.Publisher;
-import org.testng.Assert;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.ByteBufFlux;
@@ -84,8 +83,7 @@ import reactor.util.context.Context;
 import reactor.util.function.Tuple2;
 import reactor.util.function.Tuple3;
 
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.*;
 
 /**
  * @author Stephane Maldini
@@ -268,7 +266,7 @@ public class HttpServerTests {
 				         .wiretap(true)
 				         .connectNow();
 
-		Assert.assertTrue(latch.await(45, TimeUnit.SECONDS));
+		assertThat(latch.await(45, TimeUnit.SECONDS)).isTrue();
 
 		server.disposeNow();
 		client.disposeNow();
@@ -373,11 +371,11 @@ public class HttpServerTests {
 		                                                                  .delayUntil(ch -> c.inbound().receive()))
 		                              .blockLast(Duration.ofSeconds(30));
 
-		Assert.assertEquals(response0, response1);
-		Assert.assertEquals(response0, response2);
-		Assert.assertEquals(response0, response3);
-		Assert.assertEquals(response0, response4);
-		Assert.assertEquals(response0, response5);
+		assertThat(response0).isEqualTo(response1);
+		assertThat(response0).isEqualTo(response2);
+		assertThat(response0).isEqualTo(response3);
+		assertThat(response0).isEqualTo(response4);
+		assertThat(response0).isEqualTo(response5);
 
 		p.dispose();
 		s.disposeNow();
@@ -387,7 +385,7 @@ public class HttpServerTests {
 	public void gettingOptionsDuplicates() {
 		HttpServer server = HttpServer.create()
 		                              .port(123)
-		                              .host(("foo"))
+		                              .host(("example.com"))
 		                              .compress(true);
 		assertThat(server.tcpConfiguration().configure())
 		          .isNotSameAs(HttpServer.DEFAULT_TCP_SERVER)
@@ -527,10 +525,10 @@ public class HttpServerTests {
 				HttpServer.create()
 				          .host("localhost")
 				          .route(r -> r.route(req -> req.uri().startsWith("/1"),
-				                                  (req, res) -> res.sendString(Mono.just("OK")))
+				                                  (req, res) -> res.sendString(Flux.just("OK").hide()))
 				                       .route(req -> req.uri().startsWith("/2"),
 				                                  (req, res) -> res.chunkedTransfer(false)
-				                                                   .sendString(Mono.just("OK")))
+				                                                   .sendString(Flux.just("OK").hide()))
 				                       .route(req -> req.uri().startsWith("/3"),
 				                                  (req, res) -> {
 				                                                res.responseHeaders().set("Content-Length", 2);
@@ -817,10 +815,10 @@ public class HttpServerTests {
 					HttpServer.create()
 					          .port(d.port())
 					          .bindNow();
-					Assert.fail("illegal-success");
+					fail("illegal-success");
 				}
 				catch (ChannelBindException e){
-					Assert.assertEquals(e.localPort(), d.port());
+					assertThat(e.localPort()).isEqualTo(d.port());
 					e.printStackTrace();
 				}
 				d.disposeNow();
@@ -916,15 +914,20 @@ public class HttpServerTests {
 	public void testDropPublisherConnectionClose() throws Exception {
 		ByteBuf data = ByteBufAllocator.DEFAULT.buffer();
 		data.writeCharSequence("test", Charset.defaultCharset());
+		CountDownLatch latch = new CountDownLatch(1);
 		doTestDropData(
 				(req, res) -> res.header("Content-Length", "0")
-				                 .send(Mono.fromRunnable(() -> Flux.just(data, data.retain(), data.retain())))
+				                 .send(Flux.defer(() -> Flux.just(data, data.retain(), data.retain())))
 				                 .then()
-				                 .doOnCancel(() -> ReferenceCountUtil.release(data)),
+				                 .doOnCancel(() -> {
+				                     ReferenceCountUtil.release(data);
+				                     latch.countDown();
+				                 }),
 				(req, out) -> {
 					req.addHeader("Connection", "close");
 					return out;
 				});
+		assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 		assertThat(ReferenceCountUtil.refCnt(data)).isEqualTo(0);
 	}
 
@@ -946,12 +949,17 @@ public class HttpServerTests {
 	public void testDropPublisher() throws Exception {
 		ByteBuf data = ByteBufAllocator.DEFAULT.buffer();
 		data.writeCharSequence("test", Charset.defaultCharset());
+		CountDownLatch latch = new CountDownLatch(1);
 		doTestDropData(
 				(req, res) -> res.header("Content-Length", "0")
-				                 .send(Mono.fromRunnable(() -> Flux.just(data, data.retain(), data.retain())))
+				                 .send(Flux.defer(() -> Flux.just(data, data.retain(), data.retain())))
 				                 .then()
-				                 .doOnCancel(() -> ReferenceCountUtil.release(data)),
+				                 .doOnCancel(() -> {
+				                     ReferenceCountUtil.release(data);
+				                     latch.countDown();
+				                 }),
 				(req, out) -> out);
+		assertThat(latch.await(30, TimeUnit.SECONDS)).isTrue();
 		assertThat(ReferenceCountUtil.refCnt(data)).isEqualTo(0);
 	}
 
@@ -1117,7 +1125,7 @@ public class HttpServerTests {
 				          .secure(spec -> spec.sslContext(serverCtx))
 				          .handle((req, res) -> {
 				              res.withConnection(DisposableChannel::dispose);
-				              return res.sendString(Mono.just("OK"))
+				              return res.sendString(Flux.just("OK").hide())
 				                        .then()
 				                        .doOnError(t -> {
 				                            error.set(t);

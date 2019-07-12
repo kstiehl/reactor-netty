@@ -8,7 +8,6 @@ build
 .settings
 out
 *.log
-*.i*
 *.java.hsp
 *.index
 *.data
@@ -18,3 +17,5 @@ exportToHtml
 .ruleset
 .rulesets
 .gradletasknamecache
+*.iml
+.idea

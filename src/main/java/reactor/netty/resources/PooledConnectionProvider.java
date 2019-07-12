@@ -47,6 +47,7 @@ import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.MonoProcessor;
 import reactor.core.publisher.MonoSink;
+import reactor.core.scheduler.Schedulers;
 import reactor.netty.Connection;
 import reactor.netty.ConnectionObserver;
 import reactor.netty.channel.BootstrapHandlers;
@@ -165,13 +166,8 @@ final class PooledConnectionProvider implements ConnectionProvider {
 	}
 
 	@Override
-	public void dispose() {
-		disposeLater().subscribe();
-	}
-
-	@Override
 	public Mono<Void> disposeLater() {
-		return Mono.fromRunnable(() -> {
+		return Mono.<Void>fromRunnable(() -> {
 			Pool pool;
 			for (PoolKey key : channelPools.keySet()) {
 				pool = channelPools.remove(key);
@@ -179,7 +175,8 @@ final class PooledConnectionProvider implements ConnectionProvider {
 					pool.close();
 				}
 			}
-		});
+		})
+		.subscribeOn(Schedulers.elastic());
 	}
 
 	@Override
@@ -534,7 +531,7 @@ final class PooledConnectionProvider implements ConnectionProvider {
 				PendingConnectionObserver pending = (PendingConnectionObserver)current;
 				PendingConnectionObserver.Pending p;
 				current = null;
-				registerClose(c);
+				registerClose(c, pool);
 
 				while((p = pending.pendingQueue.poll()) != null) {
 					if (p.error != null) {
@@ -546,7 +543,7 @@ final class PooledConnectionProvider implements ConnectionProvider {
 				}
 			}
 			else if (current == null) {
-				registerClose(c);
+				registerClose(c, pool);
 			}
 
 
@@ -589,7 +586,11 @@ final class PooledConnectionProvider implements ConnectionProvider {
 			}
 		}
 
-		void registerClose(Channel c) {
+		// The close lambda expression refers to pool,
+		// so it will have a implicit reference to `DisposableAcquire.this`,
+		// As a result this will avoid GC from recycling other references of this.
+		// Use Pool in the method declaration to avoid it.
+		void registerClose(Channel c, Pool pool) {
 			if (log.isDebugEnabled()) {
 				log.debug(format(c, "Registering pool release on close event for channel"));
 			}
@@ -632,7 +633,7 @@ final class PooledConnectionProvider implements ConnectionProvider {
 				Channel c = f.get();
 
 				if (!c.isActive()) {
-					registerClose(c);
+					registerClose(c, pool);
 					if (!retried) {
 						if (log.isDebugEnabled()) {
 							log.debug(format(c, "Immediately aborted pooled channel, re-acquiring new channel"));

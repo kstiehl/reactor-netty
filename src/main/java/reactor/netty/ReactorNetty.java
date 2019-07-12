@@ -24,10 +24,12 @@ import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufHolder;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -44,6 +46,7 @@ import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCounted;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
+import reactor.core.CorePublisher;
 import reactor.core.publisher.BaseSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -58,6 +61,118 @@ import reactor.util.context.Context;
  * @author Stephane Maldini
  */
 public final class ReactorNetty {
+
+	// System properties names
+
+
+	/**
+	 * Specifies whether the channel ID will be prepended to the log message when possible.
+	 * By default it will be prepended.
+	 */
+	static final boolean LOG_CHANNEL_INFO =
+			Boolean.parseBoolean(System.getProperty("reactor.netty.logChannelInfo", "true"));
+
+	/**
+	 * Default worker thread count, fallback to available processor
+	 * (but with a minimum value of 4)
+	 */
+	public static final String IO_WORKER_COUNT = "reactor.netty.ioWorkerCount";
+	/**
+	 * Default selector thread count, fallback to -1 (no selector thread)
+	 */
+	public static final String IO_SELECT_COUNT = "reactor.netty.ioSelectCount";
+	/**
+	 * Default worker thread count for UDP, fallback to available processor
+	 * (but with a minimum value of 4)
+	 */
+	public static final String UDP_IO_THREAD_COUNT = "reactor.netty.udp.ioThreadCount";
+
+
+	/**
+	 * Default value whether the native transport (epoll, kqueue) will be preferred,
+	 * fallback it will be preferred when available
+	 */
+	public static final String NATIVE = "reactor.netty.native";
+
+
+	/**
+	 * Default max connections, if -1 will never wait to acquire before opening a new
+	 * connection in an unbounded fashion. Fallback to
+	 * available number of processors (but with a minimum value of 16)
+	 */
+	public static final String POOL_MAX_CONNECTIONS = "reactor.netty.pool.maxConnections";
+	/**
+	 * Default acquisition timeout (milliseconds) before error. If -1 will never wait to
+	 * acquire before opening a new
+	 * connection in an unbounded fashion. Fallback 45 seconds
+	 */
+	public static final String POOL_ACQUIRE_TIMEOUT = "reactor.netty.pool.acquireTimeout";
+
+
+	/**
+	 * Default SSL handshake timeout (milliseconds), fallback to 10 seconds
+	 */
+	public static final String SSL_HANDSHAKE_TIMEOUT = "reactor.netty.tcp.sslHandshakeTimeout";
+	/**
+	 * Default value whether the SSL debugging on the client side will be enabled/disabled,
+	 * fallback to SSL debugging disabled
+	 */
+	public static final String SSL_CLIENT_DEBUG = "reactor.netty.tcp.ssl.client.debug";
+	/**
+	 * Default value whether the SSL debugging on the server side will be enabled/disabled,
+	 * fallback to SSL debugging disabled
+	 */
+	public static final String SSL_SERVER_DEBUG = "reactor.netty.tcp.ssl.server.debug";
+
+
+	/**
+	 * Specifies whether the Http Server access log will be enabled.
+	 * By default it is disabled.
+	 */
+	public static final String ACCESS_LOG_ENABLED = "reactor.netty.http.server.accessLogEnabled";
+
+
+	/**
+	 * Try to call {@link ReferenceCounted#release()} if the specified message implements {@link ReferenceCounted}.
+	 * If the specified message doesn't implement {@link ReferenceCounted} or it is already released,
+	 * this method does nothing.
+	 */
+	public static void safeRelease(Object msg) {
+		if (msg instanceof ReferenceCounted) {
+			ReferenceCounted referenceCounted = (ReferenceCounted) msg;
+			if (referenceCounted.refCnt() > 0) {
+				referenceCounted.release();
+			}
+		}
+	}
+
+	/**
+	 * Append channel ID to a log message for correlated traces
+	 * @param channel current channel associated with the msg
+	 * @param msg the log msg
+	 * @return a formatted msg
+	 */
+	public static String format(Channel channel, String msg) {
+		if (LOG_CHANNEL_INFO) {
+			String channelStr = channel.toString();
+			return new StringBuilder(channelStr.length() + 1 + msg.length())
+					.append(channel)
+					.append(' ')
+					.append(msg)
+					.toString();
+		}
+		else {
+			return msg;
+		}
+	}
+	/**
+	 * Wrap possibly fatal or singleton exception into a new exception instance in order to propagate in reactor flows without side effect.
+	 *
+	 * @return a wrapped {@link RuntimeException}
+	 */
+	public static RuntimeException wrapException(Throwable throwable) {
+		return new InternalNettyException(Objects.requireNonNull(throwable));
+	}
 
 	static void addChunkedWriter(Connection c){
 		if (c.channel()
@@ -294,7 +409,7 @@ public final class ReactorNetty {
 	}
 
 
-	static <T, V> Publisher<V> publisherOrScalarMap(Publisher<T> publisher,
+	static <T, V> CorePublisher<V> publisherOrScalarMap(Publisher<T> publisher,
 			Function<? super T, ? extends V> mapper) {
 
 		if (publisher instanceof Callable) {
@@ -422,8 +537,13 @@ public final class ReactorNetty {
 		}
 
 		@Override
-		public NettyOutbound sendObject(Publisher<?> dataStream) {
-			return then(source.sendObject(dataStream));
+		public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+			return then(source.send(dataStream, predicate));
+		}
+
+		@Override
+		public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
+			return then(source.sendObject(dataStream, predicate));
 		}
 
 		@Override
@@ -603,7 +723,12 @@ public final class ReactorNetty {
 			}
 
 			@Override
-			public NettyOutbound sendObject(Publisher<?> dataStream) {
+			public NettyOutbound send(Publisher<? extends ByteBuf> dataStream, Predicate<ByteBuf> predicate) {
+				return this;
+			}
+
+			@Override
+			public NettyOutbound sendObject(Publisher<?> dataStream, Predicate<Object> predicate) {
 				return this;
 			}
 
@@ -632,6 +757,18 @@ public final class ReactorNetty {
 		};
 	}
 
+	static final class InternalNettyException extends RuntimeException {
+
+		InternalNettyException(Throwable cause) {
+			super(cause);
+		}
+
+		@Override
+		public synchronized Throwable fillInStackTrace() {
+			return this;
+		}
+	}
+
 	static final ConnectionObserver NOOP_LISTENER = (connection, newState) -> {};
 
 	static final Logger log                               = Loggers.getLogger(ReactorNetty.class);
@@ -651,101 +788,12 @@ public final class ReactorNetty {
 	};
 
 
-	/**
-	 * Specifies whether the channel ID will be prepended to the log message when possible.
-	 * By default it will be prepended.
-	 */
-	static final boolean LOG_CHANNEL_INFO =
-			Boolean.parseBoolean(System.getProperty("reactor.netty.logChannelInfo", "true"));
+	static final Predicate<ByteBuf>        PREDICATE_BB_FLUSH    = b -> false;
 
-	public static String format(Channel channel, String msg) {
-		if (LOG_CHANNEL_INFO) {
-			String channelStr = channel.toString();
-			return new StringBuilder(channelStr.length() + 1 + msg.length())
-					.append(channel)
-					.append(' ')
-					.append(msg)
-					.toString();
-		}
-		else {
-			return msg;
-		}
-	}
+	static final Predicate<Object>         PREDICATE_FLUSH       = o -> false;
 
+	static final ByteBuf                   BOUNDARY              = Unpooled.EMPTY_BUFFER;
 
-	/**
-	 * Try to call {@link ReferenceCounted#release()} if the specified message implements {@link ReferenceCounted}.
-	 * If the specified message doesn't implement {@link ReferenceCounted} or it is already released,
-	 * this method does nothing.
-	 */
-	public static void safeRelease(Object msg) {
-		if (msg instanceof ReferenceCounted) {
-			ReferenceCounted referenceCounted = (ReferenceCounted) msg;
-			if (referenceCounted.refCnt() > 0) {
-				referenceCounted.release();
-			}
-		}
-	}
+	public static final Predicate<ByteBuf> PREDICATE_GROUP_FLUSH = b -> b == BOUNDARY;
 
-
-	// System properties names
-
-	/**
-	 * Default worker thread count, fallback to available processor
-	 * (but with a minimum value of 4)
-	 */
-	public static final String IO_WORKER_COUNT = "reactor.netty.ioWorkerCount";
-	/**
-	 * Default selector thread count, fallback to -1 (no selector thread)
-	 */
-	public static final String IO_SELECT_COUNT = "reactor.netty.ioSelectCount";
-	/**
-	 * Default worker thread count for UDP, fallback to available processor
-	 * (but with a minimum value of 4)
-	 */
-	public static final String UDP_IO_THREAD_COUNT = "reactor.netty.udp.ioThreadCount";
-
-
-	/**
-	 * Default value whether the native transport (epoll, kqueue) will be preferred,
-	 * fallback it will be preferred when available
-	 */
-	public static final String NATIVE = "reactor.netty.native";
-
-
-	/**
-	 * Default max connections, if -1 will never wait to acquire before opening a new
-	 * connection in an unbounded fashion. Fallback to
-	 * available number of processors (but with a minimum value of 16)
-	 */
-	public static final String POOL_MAX_CONNECTIONS = "reactor.netty.pool.maxConnections";
-	/**
-	 * Default acquisition timeout (milliseconds) before error. If -1 will never wait to
-	 * acquire before opening a new
-	 * connection in an unbounded fashion. Fallback 45 seconds
-	 */
-	public static final String POOL_ACQUIRE_TIMEOUT = "reactor.netty.pool.acquireTimeout";
-
-
-	/**
-	 * Default SSL handshake timeout (milliseconds), fallback to 10 seconds
-	 */
-	public static final String SSL_HANDSHAKE_TIMEOUT = "reactor.netty.tcp.sslHandshakeTimeout";
-	/**
-	 * Default value whether the SSL debugging on the client side will be enabled/disabled,
-	 * fallback to SSL debugging disabled
-	 */
-	public static final String SSL_CLIENT_DEBUG = "reactor.netty.tcp.ssl.client.debug";
-	/**
-	 * Default value whether the SSL debugging on the server side will be enabled/disabled,
-	 * fallback to SSL debugging disabled
-	 */
-	public static final String SSL_SERVER_DEBUG = "reactor.netty.tcp.ssl.server.debug";
-
-
-	/**
-	 * Specifies whether the Http Server access log will be enabled.
-	 * By default it is disabled.
-	 */
-	public static final String ACCESS_LOG_ENABLED = "reactor.netty.http.server.accessLogEnabled";
 }
